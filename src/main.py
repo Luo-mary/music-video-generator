@@ -415,6 +415,147 @@ class MusicVideoGenerator:
 
         return str(final_path)
 
+    # ── Step 5: Lip-sync via Sync.so ─────────────────────────
+
+    def lip_sync(self, video_path: str, audio_path: str) -> str:
+        """Apply AI lip-sync to the final video using Sync.so API.
+
+        Requires SYNC_API_KEY in .env. If not set, skips lip-sync.
+        The API needs publicly accessible URLs, so we upload to a temp host.
+        """
+        sync_api_key = os.getenv("SYNC_API_KEY", "")
+        if not sync_api_key:
+            print("\n👄 Step 5: Lip-sync skipped (no SYNC_API_KEY)")
+            print("   To enable, add SYNC_API_KEY to .env (get one at https://sync.so)")
+            return video_path
+
+        print(f"\n👄 Step 5: Applying lip-sync via Sync.so...")
+
+        try:
+            # Sync.so needs URLs — use file upload to get accessible URLs
+            # Upload video
+            print("   📤 Uploading video to Sync.so...")
+            upload_headers = {
+                "x-api-key": sync_api_key,
+            }
+
+            with open(video_path, "rb") as vf:
+                upload_resp = requests.post(
+                    "https://api.sync.so/v2/upload",
+                    headers=upload_headers,
+                    files={"file": ("video.mp4", vf, "video/mp4")},
+                    timeout=300
+                )
+
+            if upload_resp.status_code not in (200, 201):
+                print(f"   ⚠️ Video upload failed: {upload_resp.text[:200]}")
+                return video_path
+
+            video_upload = upload_resp.json()
+            video_url = video_upload.get("url", "")
+            video_asset_id = video_upload.get("id", "")
+
+            # Upload audio
+            print("   📤 Uploading audio to Sync.so...")
+            with open(audio_path, "rb") as af:
+                upload_resp = requests.post(
+                    "https://api.sync.so/v2/upload",
+                    headers=upload_headers,
+                    files={"file": ("audio.mp3", af, "audio/mpeg")},
+                    timeout=300
+                )
+
+            if upload_resp.status_code not in (200, 201):
+                print(f"   ⚠️ Audio upload failed: {upload_resp.text[:200]}")
+                return video_path
+
+            audio_upload = upload_resp.json()
+            audio_url = audio_upload.get("url", "")
+            audio_asset_id = audio_upload.get("id", "")
+
+            # Create lip-sync generation job
+            print("   🎬 Creating lip-sync job...")
+            gen_headers = {
+                "x-api-key": sync_api_key,
+                "Content-Type": "application/json",
+            }
+
+            # Build input — prefer assetId if available, fall back to url
+            video_input = {"type": "video"}
+            if video_asset_id:
+                video_input["assetId"] = video_asset_id
+            else:
+                video_input["url"] = video_url
+
+            audio_input = {"type": "audio", "refId": "audio_track"}
+            if audio_asset_id:
+                audio_input["assetId"] = audio_asset_id
+            else:
+                audio_input["url"] = audio_url
+
+            gen_resp = requests.post(
+                "https://api.sync.so/v2/generate",
+                headers=gen_headers,
+                json={
+                    "model": "lipsync-2",
+                    "input": [video_input, audio_input],
+                    "options": {
+                        "sync_mode": "cut_off",
+                    },
+                },
+                timeout=60
+            )
+
+            if gen_resp.status_code not in (200, 201):
+                print(f"   ⚠️ Job creation failed: {gen_resp.text[:200]}")
+                return video_path
+
+            job = gen_resp.json()
+            job_id = job.get("id", "")
+            print(f"   📋 Job ID: {job_id}")
+
+            # Poll for completion
+            max_attempts = 120  # 20 min max
+            for attempt in range(max_attempts):
+                time.sleep(10)
+
+                status_resp = requests.get(
+                    f"https://api.sync.so/v2/generate/{job_id}",
+                    headers={"x-api-key": sync_api_key},
+                    timeout=30
+                )
+
+                status_data = status_resp.json()
+                status = status_data.get("status", "")
+
+                if status == "COMPLETED":
+                    output_url = status_data.get("outputUrl", "")
+                    if output_url:
+                        # Download lip-synced video
+                        lipsync_path = self.output_dir / "final_video_lipsync.mp4"
+                        dl_resp = requests.get(output_url, timeout=300)
+                        lipsync_path.write_bytes(dl_resp.content)
+                        print(f"   ✅ Lip-synced video: {lipsync_path}")
+                        return str(lipsync_path)
+                    else:
+                        print("   ⚠️ No output URL in completed job")
+                        return video_path
+
+                elif status in ("FAILED", "REJECTED"):
+                    error = status_data.get("error", "unknown")
+                    print(f"   ❌ Lip-sync failed: {error}")
+                    return video_path
+
+                elif attempt % 6 == 0:
+                    print(f"   ⏳ Lip-sync processing... ({status})")
+
+            print("   ⚠️ Lip-sync timed out")
+            return video_path
+
+        except Exception as e:
+            print(f"   ⚠️ Lip-sync error: {e}")
+            return video_path
+
     # ── Main Pipeline ─────────────────────────────────────────
 
     def run(self, prompt: str, band: list[dict],
@@ -451,15 +592,18 @@ class MusicVideoGenerator:
             print("\n❌ Video generation failed. Aborting.")
             return ""
 
-        # Step 4: Merge
-        final_path = self.merge_final_video(clip_paths, music_path)
+        # Step 4: Merge clips + music
+        merged_path = self.merge_final_video(clip_paths, music_path)
+        if not merged_path:
+            print("\n❌ Failed to merge video.")
+            return ""
 
-        if final_path:
-            print("\n" + "=" * 60)
-            print(f"  ✅ Done! Final music video: {final_path}")
-            print("=" * 60 + "\n")
-        else:
-            print("\n❌ Failed to create final video.")
+        # Step 5: Lip-sync (optional, requires SYNC_API_KEY)
+        final_path = self.lip_sync(merged_path, music_path)
+
+        print("\n" + "=" * 60)
+        print(f"  ✅ Done! Final music video: {final_path}")
+        print("=" * 60 + "\n")
 
         return final_path
 

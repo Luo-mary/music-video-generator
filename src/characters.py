@@ -1036,11 +1036,27 @@ def build_band_prompt(band: list[dict]) -> str:
 
 
 def build_closeup_prompt(member: dict, scene: str = "") -> str:
-    """Build a close-up video prompt for a single band member."""
+    """Build a close-up video prompt for a single band member.
+
+    For vocalists, adds explicit singing/mouth movement cues for better lip-sync.
+    """
+    is_vocalist = member["role_id"] == "vocalist"
+
+    if is_vocalist:
+        singing_cues = (
+            "The character is actively singing with clear visible mouth movements — "
+            "mouth opening and closing rhythmically to the beat, lips forming words, "
+            "expressive facial movements showing emotion while singing. "
+            "The mouth movements are exaggerated and cartoon-like, clearly visible. "
+        )
+    else:
+        singing_cues = ""
+
     return (
         f"Close-up shot in a cute 3D Pixar-style cartoon music video. "
         f"{member['visual']} "
         f"This character is joyfully {member['role']['description']}. "
+        f"{singing_cues}"
         f"The camera focuses on {member['character_name']} at {member['role']['stage_position']}, "
         f"showing their cute expressive face and fun dynamic movements. "
         f"High quality 3D cartoon animation, vibrant stage lighting, colorful bokeh background. "
