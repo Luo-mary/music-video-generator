@@ -2,12 +2,16 @@
 """
 Music Video Generator Workflow
 -------------------------------
-1. Generate music from prompt (MiniMax Music API - music-2.5+)
-2. Generate multiple video clips (MiniMax Video API - Hailuo)
-3. Concatenate clips and merge with music (ffmpeg)
+1. Select band members (roles + animal characters)
+2. Generate music from prompt (MiniMax Music API - music-2.5+)
+3. Generate multiple video clips with consistent characters (MiniMax Video API - Hailuo)
+4. Concatenate clips and merge with music (ffmpeg)
 
 Usage:
-    python src/main.py --prompt "A happy upbeat pop song with drums, bass, guitar"
+    python src/main.py --prompt "A happy upbeat pop song" --band-size 4
+    python src/main.py --prompt "A rock ballad" --band-size 5 --assign vocalist=luna_cat guitarist=blaze_fox
+    python src/main.py --list-characters
+    python src/main.py --list-roles
 """
 
 import os
@@ -17,9 +21,13 @@ import requests
 import json
 import time
 import subprocess
-import shutil
 from pathlib import Path
 from dotenv import load_dotenv
+from characters import (
+    build_band, build_band_prompt, build_closeup_prompt,
+    list_characters, list_roles, get_band_roles,
+    ANIMAL_CHARACTERS, BAND_ROLES,
+)
 
 # Config
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
@@ -29,21 +37,51 @@ CLIP_DURATION = 6  # seconds per Hailuo clip
 # Load env vars
 load_dotenv(SCRIPT_DIR / ".env")
 
-# Varied scene prompts for different clips to keep the video interesting
-SCENE_VARIATIONS = [
-    "wide shot of {base}, bright stage lights flashing",
-    "close-up of {base}, camera focused on the singer rabbit",
-    "medium shot of {base}, camera panning across the band",
-    "close-up of the bear playing drums energetically, {base}",
-    "close-up of the cat grooving on bass guitar, {base}",
-    "close-up of the dog shredding electric guitar, {base}",
-    "wide shot of {base}, confetti falling from above",
-    "low angle shot of {base}, crowd of cartoon animals cheering",
-    "side view of {base}, colorful spotlights sweeping the stage",
-    "close-up of the rabbit singing passionately into the microphone, {base}",
-    "overhead shot of {base}, balloons floating around",
-    "dynamic shot of {base}, all animals jumping together",
-]
+
+def build_scene_sequence(band: list[dict], num_clips: int) -> list[str]:
+    """Build a sequence of prompts that alternate between wide shots and close-ups.
+
+    Every prompt includes full character descriptions for visual consistency.
+    The sequence follows a pattern:
+      - Wide/group shots for establishing scenes
+      - Close-ups rotating through each band member
+      - Dynamic/action shots for energy
+    """
+    prompts = []
+
+    # Scene modifiers for wide/group shots
+    wide_scenes = [
+        "Wide establishing shot, camera slowly zooming in, dramatic stage lighting with spotlights.",
+        "Wide shot from audience perspective, the crowd cheering, confetti falling from above.",
+        "Low angle wide shot looking up at the band, powerful stage presence, lens flare effects.",
+        "Side-angle wide shot, colorful spotlights sweeping across the stage, smoke machine haze.",
+        "Overhead bird's-eye view looking down at the stage, radial light patterns.",
+        "Wide dynamic shot, all band members jumping in sync, explosive energy, strobe lights.",
+    ]
+
+    # Build the full band description once (used in every prompt for consistency)
+    band_description = build_band_prompt(band)
+
+    for i in range(num_clips):
+        cycle_pos = i % (len(band) + 2)  # +2 for wide shots in the cycle
+
+        if cycle_pos == 0:
+            # Opening/recurring wide shot
+            scene = wide_scenes[i // (len(band) + 2) % len(wide_scenes)]
+            prompts.append(f"{band_description} {scene}")
+
+        elif cycle_pos <= len(band):
+            # Close-up of each band member in rotation
+            member = band[cycle_pos - 1]
+            prompts.append(build_closeup_prompt(member,
+                scene="Energetic performance moment, the character is fully immersed in the music."))
+
+        else:
+            # Action/dynamic wide shot
+            scene = wide_scenes[(i // (len(band) + 2) + 3) % len(wide_scenes)]
+            prompts.append(f"{band_description} {scene}")
+
+    return prompts
 
 
 class MusicVideoGenerator:
@@ -62,7 +100,7 @@ class MusicVideoGenerator:
 
     def generate_music(self, prompt: str) -> tuple[str, float]:
         """Generate music and return (path, duration_seconds)."""
-        print(f"\n🎵 Step 1: Generating music...")
+        print(f"\n🎵 Generating music...")
         print(f"   Prompt: {prompt}")
 
         if not self.api_key:
@@ -123,25 +161,6 @@ class MusicVideoGenerator:
             print(f"      ⚠️ Failed to submit task: {status_msg}")
         return task_id
 
-    def _poll_video_task(self, task_id: str) -> str:
-        """Poll until task completes, return file_id."""
-        for attempt in range(60):
-            time.sleep(10)
-            resp = requests.get(
-                f"{self.base_url}/query/video_generation",
-                headers=self.headers,
-                params={"task_id": task_id},
-                timeout=30
-            )
-            data = resp.json()
-            status = data.get("status", "")
-            if status == "Success":
-                return data.get("file_id", "")
-            elif status == "Fail":
-                print(f"      ❌ Task {task_id} failed: {data.get('error_message', '')}")
-                return ""
-        return ""
-
     def _download_video(self, file_id: str, save_path: Path) -> bool:
         """Download video by file_id."""
         resp = requests.get(
@@ -158,24 +177,18 @@ class MusicVideoGenerator:
             return True
         return False
 
-    def generate_video_clips(self, base_prompt: str, num_clips: int, model: str) -> list[str]:
-        """Generate multiple video clips with scene variations.
+    def generate_video_clips(self, prompts: list[str], model: str) -> list[str]:
+        """Generate video clips from a list of prompts.
 
-        Submits all tasks in parallel, then polls them all.
+        Submits tasks in batches to respect rate limits, polls until done.
         """
-        print(f"\n🎬 Step 2: Generating {num_clips} video clips...")
+        num_clips = len(prompts)
+        print(f"\n🎬 Generating {num_clips} video clips...")
 
-        # Build varied prompts
-        prompts = []
-        for i in range(num_clips):
-            variation = SCENE_VARIATIONS[i % len(SCENE_VARIATIONS)]
-            prompts.append(variation.format(base=base_prompt))
-
-        # Submit all tasks in batches to respect rate limits
+        # Submit all tasks in batches
         BATCH_SIZE = 5
-        tasks = []  # (index, task_id)
+        tasks = []
         for i, prompt in enumerate(prompts):
-            # Pause between batches to avoid rate limiting
             if i > 0 and i % BATCH_SIZE == 0:
                 print(f"   ⏸️  Pausing 60s for rate limit (batch {i // BATCH_SIZE + 1})...")
                 time.sleep(60)
@@ -204,8 +217,8 @@ class MusicVideoGenerator:
 
         # Poll all tasks until done
         print(f"\n   ⏳ Waiting for {len(tasks)} clips to generate...")
-        pending = dict(tasks)  # index -> task_id
-        completed = {}  # index -> file_id
+        pending = dict(tasks)
+        completed = {}
         failed = set()
 
         while pending:
@@ -241,7 +254,6 @@ class MusicVideoGenerator:
         for idx in sorted(completed.keys()):
             clip_path = self.clips_dir / f"clip_{idx:03d}.mp4"
             if self._download_video(completed[idx], clip_path):
-                # Re-encode for consistent format
                 encoded_path = self.clips_dir / f"clip_{idx:03d}_enc.mp4"
                 subprocess.run([
                     "ffmpeg", "-y", "-i", str(clip_path),
@@ -258,19 +270,17 @@ class MusicVideoGenerator:
 
     def merge_final_video(self, clip_paths: list[str], music_path: str) -> str:
         """Concatenate clips and merge with music using ffmpeg."""
-        print(f"\n🎞️ Step 3: Building final music video...")
+        print(f"\n🎞️ Building final music video...")
 
         if not clip_paths:
             print("   ⚠️ No clips to merge")
             return ""
 
-        # Create ffmpeg concat file
         concat_file = self.output_dir / "concat.txt"
         with open(concat_file, "w") as f:
             for path in clip_paths:
                 f.write(f"file '{path}'\n")
 
-        # Concatenate all clips into one video (no audio)
         concat_video = self.output_dir / "concat_video.mp4"
         print("   🔗 Concatenating clips...")
         result = subprocess.run([
@@ -285,7 +295,6 @@ class MusicVideoGenerator:
             print(f"   ⚠️ Concat failed: {result.stderr[-200:]}")
             return ""
 
-        # Merge music onto video — use shortest stream to determine duration
         final_path = self.output_dir / "final_video.mp4"
         print("   🎶 Merging music with video...")
         result = subprocess.run([
@@ -302,27 +311,31 @@ class MusicVideoGenerator:
             print(f"   ⚠️ Merge failed: {result.stderr[-200:]}")
             return ""
 
-        # Get final duration
         probe = subprocess.run(
             ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
              "-of", "csv=p=0", str(final_path)],
             capture_output=True, text=True
         )
         duration = float(probe.stdout.strip()) if probe.stdout.strip() else 0
-
         print(f"   ✅ Final video: {final_path} ({duration:.1f}s)")
 
-        # Cleanup temp files
         concat_file.unlink(missing_ok=True)
         concat_video.unlink(missing_ok=True)
 
         return str(final_path)
 
-    def run(self, prompt: str, video_prompt: str = None, video_model: str = "MiniMax-Hailuo-2.3"):
+    def run(self, prompt: str, band: list[dict], video_model: str = "MiniMax-Hailuo-2.3"):
         """Run the full workflow."""
         print("\n" + "=" * 60)
         print("  🎸 Music Video Generator (MiniMax Edition)")
         print("=" * 60)
+
+        # Display band lineup
+        print("\n🎤 Band Lineup:")
+        for m in band:
+            char = m["character"]
+            role = m["role"]
+            print(f"   {role['name']:20s} → {char['name']} ({char['species']})")
 
         # Step 1: Generate music
         music_path, music_duration = self.generate_music(prompt)
@@ -330,18 +343,19 @@ class MusicVideoGenerator:
             print("\n❌ Music generation failed. Aborting.")
             return ""
 
-        # Step 2: Generate video clips to cover music duration
+        # Step 2: Build scene sequence with consistent character prompts
         num_clips = max(1, math.ceil(music_duration / CLIP_DURATION))
         print(f"\n   📊 Music is {music_duration:.1f}s — need {num_clips} clips ({CLIP_DURATION}s each)")
 
-        base_video_prompt = video_prompt or "a cartoon band of cute animals - a bear on drums, a cat on bass guitar, a dog on electric guitar, and a rabbit singing - performing on a colorful festival stage with balloons and confetti, cartoon animated style, vibrant colors"
-        clip_paths = self.generate_video_clips(base_video_prompt, num_clips, video_model)
+        prompts = build_scene_sequence(band, num_clips)
 
+        # Step 3: Generate video clips
+        clip_paths = self.generate_video_clips(prompts, video_model)
         if not clip_paths:
             print("\n❌ Video generation failed. Aborting.")
             return ""
 
-        # Step 3: Merge clips + music into final video
+        # Step 4: Merge clips + music into final video
         final_path = self.merge_final_video(clip_paths, music_path)
 
         if final_path:
@@ -354,14 +368,83 @@ class MusicVideoGenerator:
         return final_path
 
 
+def parse_assignments(assign_list: list[str]) -> dict[str, str]:
+    """Parse assignment strings like 'vocalist=luna_cat' into a dict."""
+    assignments = {}
+    if not assign_list:
+        return assignments
+    for item in assign_list:
+        if "=" not in item:
+            print(f"⚠️ Invalid assignment format: {item} (expected role=character)")
+            continue
+        role_id, char_id = item.split("=", 1)
+        if role_id not in BAND_ROLES:
+            print(f"⚠️ Unknown role: {role_id}")
+            print(f"   Available roles: {', '.join(BAND_ROLES.keys())}")
+            continue
+        if char_id not in ANIMAL_CHARACTERS:
+            print(f"⚠️ Unknown character: {char_id}")
+            print(f"   Use --list-characters to see available characters")
+            continue
+        assignments[role_id] = char_id
+    return assignments
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Music Video Generator (MiniMax)")
-    parser.add_argument("--prompt", type=str, required=True, help="Music prompt")
-    parser.add_argument("--video-prompt", type=str, default=None, help="Video prompt (optional)")
+    parser = argparse.ArgumentParser(
+        description="Music Video Generator — Cartoon Animal Band (MiniMax)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # 4-piece band with default animals
+  python src/main.py --prompt "A happy pop song" --band-size 4
+
+  # 5-piece band with custom character assignments
+  python src/main.py --prompt "A rock anthem" --band-size 5 \\
+    --assign vocalist=thunder_wolf guitarist=spike_hedgehog
+
+  # List all available characters and roles
+  python src/main.py --list-characters
+  python src/main.py --list-roles
+        """
+    )
+    parser.add_argument("--prompt", type=str, help="Music prompt")
+    parser.add_argument("--band-size", type=int, default=4, choices=range(3, 9),
+                        help="Number of band members (3-8, default: 4)")
+    parser.add_argument("--assign", nargs="*", metavar="ROLE=CHARACTER",
+                        help="Assign animals to roles (e.g. vocalist=luna_cat drummer=rocky_bear)")
     parser.add_argument("--video-model", type=str, default="MiniMax-Hailuo-2.3",
                         choices=["MiniMax-Hailuo-2.3", "MiniMax-Hailuo-02"],
                         help="Video model to use")
+    parser.add_argument("--list-characters", action="store_true",
+                        help="List all available animal characters")
+    parser.add_argument("--list-roles", action="store_true",
+                        help="List all available band roles")
     args = parser.parse_args()
 
+    if args.list_characters:
+        print("\n🐾 Available Animal Characters:\n")
+        print(list_characters())
+        print(f"\n   Total: {len(ANIMAL_CHARACTERS)} characters\n")
+        exit(0)
+
+    if args.list_roles:
+        print("\n🎸 Available Band Roles:\n")
+        print(list_roles())
+        print(f"\n   Total: {len(BAND_ROLES)} roles\n")
+        print("   Default roles by band size:")
+        from characters import BAND_PRESETS
+        for size, roles in BAND_PRESETS.items():
+            print(f"     {size} members: {', '.join(roles)}")
+        print()
+        exit(0)
+
+    if not args.prompt:
+        parser.error("--prompt is required (unless using --list-characters or --list-roles)")
+
+    # Build the band
+    assignments = parse_assignments(args.assign)
+    band = build_band(args.band_size, assignments)
+
     generator = MusicVideoGenerator()
-    generator.run(args.prompt, args.video_prompt, args.video_model)
+    generator.run(args.prompt, band, args.video_model)
