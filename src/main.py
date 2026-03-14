@@ -2,16 +2,16 @@
 """
 Music Video Generator Workflow
 -------------------------------
-1. Select band members (roles + animal characters)
-2. Generate music from prompt (MiniMax Music API - music-2.5+)
-3. Generate multiple video clips with consistent characters (MiniMax Video API - Hailuo)
-4. Concatenate clips and merge with music (ffmpeg)
+1. Select band members (roles + animal characters + gender matching)
+2. Generate reference images for each character (MiniMax Image API - image-01)
+3. Generate music from prompt (MiniMax Music API - music-2.5+)
+4. Generate video clips with subject reference for consistency (MiniMax Video API - S2V-01)
+5. Concatenate clips and merge with music (ffmpeg)
 
 Usage:
-    python src/main.py --prompt "A happy upbeat pop song" --band-size 4
-    python src/main.py --prompt "A rock ballad" --band-size 5 --assign vocalist=luna_cat guitarist=blaze_fox
+    python src/main.py --prompt "A happy pop song" --band-size 4 --vocal-gender female
+    python src/main.py --prompt "A rock anthem" --assign vocalist=luna_cat guitarist=blaze_fox
     python src/main.py --list-characters
-    python src/main.py --list-roles
 """
 
 import os
@@ -26,62 +26,64 @@ from dotenv import load_dotenv
 from characters import (
     build_band, build_band_prompt, build_closeup_prompt,
     list_characters, list_roles, get_band_roles,
-    ANIMAL_CHARACTERS, BAND_ROLES,
+    ANIMAL_CHARACTERS, BAND_ROLES, BAND_PRESETS,
 )
 
 # Config
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
 SCRIPT_DIR = Path(__file__).parent.parent
-CLIP_DURATION = 6  # seconds per Hailuo clip
+CLIP_DURATION = 6  # seconds per video clip
 
 # Load env vars
 load_dotenv(SCRIPT_DIR / ".env")
 
 
-def build_scene_sequence(band: list[dict], num_clips: int) -> list[str]:
-    """Build a sequence of prompts that alternate between wide shots and close-ups.
+def build_scene_sequence(band: list[dict], num_clips: int) -> list[dict]:
+    """Build a sequence of clip configs (prompt + which member to use as subject reference).
 
-    Every prompt includes full character descriptions for visual consistency.
-    The sequence follows a pattern:
-      - Wide/group shots for establishing scenes
-      - Close-ups rotating through each band member
-      - Dynamic/action shots for energy
+    Returns list of dicts: {"prompt": str, "subject_member": dict or None}
+    - Wide shots: subject_member = None (no subject ref, just text prompt)
+    - Close-ups: subject_member = the specific band member
     """
-    prompts = []
-
-    # Scene modifiers for wide/group shots
     wide_scenes = [
-        "Wide establishing shot, camera slowly zooming in, dramatic stage lighting with spotlights.",
-        "Wide shot from audience perspective, the crowd cheering, confetti falling from above.",
-        "Low angle wide shot looking up at the band, powerful stage presence, lens flare effects.",
-        "Side-angle wide shot, colorful spotlights sweeping across the stage, smoke machine haze.",
-        "Overhead bird's-eye view looking down at the stage, radial light patterns.",
-        "Wide dynamic shot, all band members jumping in sync, explosive energy, strobe lights.",
+        "Wide establishing shot, camera slowly zooming in, dramatic colorful stage lighting.",
+        "Wide shot from audience view, cartoon crowd cheering, confetti falling, fun atmosphere.",
+        "Low angle wide shot looking up at the band, powerful fun stage presence, lens flare.",
+        "Side-angle wide shot, colorful spotlights sweeping, fun smoke effects on stage.",
+        "Overhead bird's-eye view of the stage, radial neon light patterns, festive mood.",
+        "Wide dynamic shot, all band members jumping together, explosive joyful energy.",
     ]
 
-    # Build the full band description once (used in every prompt for consistency)
-    band_description = build_band_prompt(band)
+    band_prompt = build_band_prompt(band)
+    clips = []
 
     for i in range(num_clips):
-        cycle_pos = i % (len(band) + 2)  # +2 for wide shots in the cycle
+        cycle_pos = i % (len(band) + 2)
 
         if cycle_pos == 0:
-            # Opening/recurring wide shot
+            # Wide/group shot
             scene = wide_scenes[i // (len(band) + 2) % len(wide_scenes)]
-            prompts.append(f"{band_description} {scene}")
-
+            clips.append({
+                "prompt": f"{band_prompt} {scene}",
+                "subject_member": None,
+            })
         elif cycle_pos <= len(band):
-            # Close-up of each band member in rotation
+            # Close-up of individual member
             member = band[cycle_pos - 1]
-            prompts.append(build_closeup_prompt(member,
-                scene="Energetic performance moment, the character is fully immersed in the music."))
-
+            clips.append({
+                "prompt": build_closeup_prompt(member,
+                    "Energetic joyful performance, fully immersed in the music, having fun."),
+                "subject_member": member,
+            })
         else:
-            # Action/dynamic wide shot
+            # Dynamic wide shot
             scene = wide_scenes[(i // (len(band) + 2) + 3) % len(wide_scenes)]
-            prompts.append(f"{band_description} {scene}")
+            clips.append({
+                "prompt": f"{band_prompt} {scene}",
+                "subject_member": None,
+            })
 
-    return prompts
+    return clips
 
 
 class MusicVideoGenerator:
@@ -90,6 +92,8 @@ class MusicVideoGenerator:
         self.output_dir.mkdir(exist_ok=True)
         self.clips_dir = self.output_dir / "clips"
         self.clips_dir.mkdir(exist_ok=True)
+        self.refs_dir = self.output_dir / "character_refs"
+        self.refs_dir.mkdir(exist_ok=True)
 
         self.api_key = os.getenv("MINIMAX_API_KEY", "")
         self.base_url = "https://api.minimax.io/v1"
@@ -98,13 +102,69 @@ class MusicVideoGenerator:
             "Content-Type": "application/json"
         }
 
+    # ── Step 1: Generate Reference Images ─────────────────────
+
+    def generate_character_images(self, band: list[dict]) -> dict[str, str]:
+        """Generate reference images for each band member using image-01.
+
+        Returns dict mapping character_id -> image_url.
+        """
+        print(f"\n🎨 Step 1: Generating character reference images...")
+
+        ref_urls = {}
+        for m in band:
+            char_key = f"{m['character_id']}_{m['gender']}"
+            print(f"   🖌️  Generating {m['character_name']} ({m['gender']})...")
+
+            try:
+                response = requests.post(
+                    f"{self.base_url}/image_generation",
+                    headers=self.headers,
+                    json={
+                        "model": "image-01",
+                        "prompt": m["image_prompt"],
+                        "aspect_ratio": "3:4",
+                        "response_format": "url",
+                        "n": 1,
+                    },
+                    timeout=120
+                )
+
+                data = response.json()
+                status_code = data.get("base_resp", {}).get("status_code", -1)
+
+                if status_code == 0:
+                    urls = data.get("data", {}).get("image_urls", [])
+                    if urls:
+                        ref_urls[char_key] = urls[0]
+                        # Also save locally
+                        img_resp = requests.get(urls[0], timeout=60)
+                        img_path = self.refs_dir / f"{char_key}.png"
+                        img_path.write_bytes(img_resp.content)
+                        print(f"      ✅ Saved: {img_path}")
+                    else:
+                        print(f"      ⚠️ No image URL returned")
+                else:
+                    status_msg = data.get("base_resp", {}).get("status_msg", "unknown")
+                    print(f"      ⚠️ Image API error: {status_code} - {status_msg}")
+
+                time.sleep(2)  # Rate limit
+
+            except Exception as e:
+                print(f"      ⚠️ Error: {e}")
+
+        print(f"   ✅ Generated {len(ref_urls)}/{len(band)} character images")
+        return ref_urls
+
+    # ── Step 2: Generate Music ────────────────────────────────
+
     def generate_music(self, prompt: str) -> tuple[str, float]:
         """Generate music and return (path, duration_seconds)."""
-        print(f"\n🎵 Generating music...")
+        print(f"\n🎵 Step 2: Generating music...")
         print(f"   Prompt: {prompt}")
 
         if not self.api_key:
-            print("⚠️ No MINIMAX_API_KEY found")
+            print("   ⚠️ No MINIMAX_API_KEY found")
             return "", 0
 
         try:
@@ -146,12 +206,30 @@ class MusicVideoGenerator:
 
         return "", 0
 
-    def _submit_video_task(self, prompt: str, model: str) -> str:
-        """Submit a video generation task, return task_id."""
+    # ── Step 3: Generate Video Clips ──────────────────────────
+
+    def _submit_video_task(self, prompt: str, model: str,
+                           subject_image_url: str = None) -> str:
+        """Submit a video generation task.
+
+        If subject_image_url is provided, uses S2V-01 with subject reference
+        for character consistency. Otherwise uses standard text-to-video.
+        """
+        payload = {"prompt": prompt}
+
+        if subject_image_url:
+            payload["model"] = "S2V-01"
+            payload["subject_reference"] = [{
+                "type": "character",
+                "image": [subject_image_url],
+            }]
+        else:
+            payload["model"] = model
+
         response = requests.post(
             f"{self.base_url}/video_generation",
             headers=self.headers,
-            json={"model": model, "prompt": prompt},
+            json=payload,
             timeout=60
         )
         data = response.json()
@@ -177,26 +255,41 @@ class MusicVideoGenerator:
             return True
         return False
 
-    def generate_video_clips(self, prompts: list[str], model: str) -> list[str]:
-        """Generate video clips from a list of prompts.
+    def generate_video_clips(self, clip_configs: list[dict],
+                              ref_urls: dict[str, str],
+                              fallback_model: str) -> list[str]:
+        """Generate video clips from clip configs.
 
-        Submits tasks in batches to respect rate limits, polls until done.
+        For close-ups with a subject_member and available reference image,
+        uses S2V-01 subject reference mode for character consistency.
         """
-        num_clips = len(prompts)
-        print(f"\n🎬 Generating {num_clips} video clips...")
+        num_clips = len(clip_configs)
+        print(f"\n🎬 Step 3: Generating {num_clips} video clips...")
 
-        # Submit all tasks in batches
         BATCH_SIZE = 5
         tasks = []
-        for i, prompt in enumerate(prompts):
+
+        for i, config in enumerate(clip_configs):
             if i > 0 and i % BATCH_SIZE == 0:
                 print(f"   ⏸️  Pausing 60s for rate limit (batch {i // BATCH_SIZE + 1})...")
                 time.sleep(60)
 
-            print(f"   📤 Submitting clip {i+1}/{num_clips}...")
+            member = config["subject_member"]
+            subject_url = None
+
+            if member:
+                char_key = f"{member['character_id']}_{member['gender']}"
+                subject_url = ref_urls.get(char_key)
+                clip_type = f"close-up of {member['character_name']}"
+            else:
+                clip_type = "wide/group shot"
+
+            print(f"   📤 Clip {i+1}/{num_clips} ({clip_type})...")
+
             task_id = ""
             for retry in range(3):
-                task_id = self._submit_video_task(prompt, model)
+                task_id = self._submit_video_task(
+                    config["prompt"], fallback_model, subject_url)
                 if task_id:
                     break
                 wait = 30 * (retry + 1)
@@ -207,19 +300,18 @@ class MusicVideoGenerator:
                 tasks.append((i, task_id))
                 print(f"      Task ID: {task_id}")
             else:
-                print(f"      ⚠️ Clip {i+1} skipped after retries")
+                print(f"      ⚠️ Clip {i+1} skipped")
 
             time.sleep(2)
 
         if not tasks:
-            print("   ⚠️ No tasks submitted successfully")
+            print("   ⚠️ No tasks submitted")
             return []
 
-        # Poll all tasks until done
-        print(f"\n   ⏳ Waiting for {len(tasks)} clips to generate...")
+        # Poll all tasks
+        print(f"\n   ⏳ Waiting for {len(tasks)} clips...")
         pending = dict(tasks)
         completed = {}
-        failed = set()
 
         while pending:
             time.sleep(10)
@@ -235,20 +327,18 @@ class MusicVideoGenerator:
                 status = data.get("status", "")
 
                 if status == "Success":
-                    file_id = data.get("file_id", "")
-                    completed[idx] = file_id
+                    completed[idx] = data.get("file_id", "")
                     print(f"      ✅ Clip {idx+1} ready")
                 elif status == "Fail":
-                    failed.add(idx)
                     print(f"      ❌ Clip {idx+1} failed: {data.get('error_message', '')}")
                 else:
                     still_pending[idx] = task_id
 
             pending = still_pending
             if pending:
-                print(f"      ⏳ {len(pending)} clips still processing, {len(completed)} done...")
+                print(f"      ⏳ {len(pending)} processing, {len(completed)} done...")
 
-        # Download all completed clips
+        # Download and re-encode
         print(f"\n   📥 Downloading {len(completed)} clips...")
         clip_paths = []
         for idx in sorted(completed.keys()):
@@ -268,12 +358,13 @@ class MusicVideoGenerator:
 
         return clip_paths
 
+    # ── Step 4: Merge Final Video ─────────────────────────────
+
     def merge_final_video(self, clip_paths: list[str], music_path: str) -> str:
         """Concatenate clips and merge with music using ffmpeg."""
-        print(f"\n🎞️ Building final music video...")
+        print(f"\n🎞️ Step 4: Building final music video...")
 
         if not clip_paths:
-            print("   ⚠️ No clips to merge")
             return ""
 
         concat_file = self.output_dir / "concat.txt"
@@ -324,8 +415,11 @@ class MusicVideoGenerator:
 
         return str(final_path)
 
-    def run(self, prompt: str, band: list[dict], video_model: str = "MiniMax-Hailuo-2.3"):
-        """Run the full workflow."""
+    # ── Main Pipeline ─────────────────────────────────────────
+
+    def run(self, prompt: str, band: list[dict],
+            video_model: str = "MiniMax-Hailuo-2.3"):
+        """Run the full pipeline."""
         print("\n" + "=" * 60)
         print("  🎸 Music Video Generator (MiniMax Edition)")
         print("=" * 60)
@@ -333,29 +427,31 @@ class MusicVideoGenerator:
         # Display band lineup
         print("\n🎤 Band Lineup:")
         for m in band:
-            char = m["character"]
-            role = m["role"]
-            print(f"   {role['name']:20s} → {char['name']} ({char['species']})")
+            gender_icon = "♀" if m["gender"] == "female" else "♂"
+            print(f"   {m['role']['name']:20s} → {m['character_name']} "
+                  f"({m['species']}) {gender_icon}")
 
-        # Step 1: Generate music
+        # Step 1: Generate reference images
+        ref_urls = self.generate_character_images(band)
+
+        # Step 2: Generate music
         music_path, music_duration = self.generate_music(prompt)
         if not music_path:
             print("\n❌ Music generation failed. Aborting.")
             return ""
 
-        # Step 2: Build scene sequence with consistent character prompts
-        num_clips = max(1, math.ceil(music_duration / CLIP_DURATION))
-        print(f"\n   📊 Music is {music_duration:.1f}s — need {num_clips} clips ({CLIP_DURATION}s each)")
-
-        prompts = build_scene_sequence(band, num_clips)
-
         # Step 3: Generate video clips
-        clip_paths = self.generate_video_clips(prompts, video_model)
+        num_clips = max(1, math.ceil(music_duration / CLIP_DURATION))
+        print(f"\n   📊 Music is {music_duration:.1f}s — need {num_clips} clips")
+
+        clip_configs = build_scene_sequence(band, num_clips)
+        clip_paths = self.generate_video_clips(clip_configs, ref_urls, video_model)
+
         if not clip_paths:
             print("\n❌ Video generation failed. Aborting.")
             return ""
 
-        # Step 4: Merge clips + music into final video
+        # Step 4: Merge
         final_path = self.merge_final_video(clip_paths, music_path)
 
         if final_path:
@@ -369,22 +465,20 @@ class MusicVideoGenerator:
 
 
 def parse_assignments(assign_list: list[str]) -> dict[str, str]:
-    """Parse assignment strings like 'vocalist=luna_cat' into a dict."""
+    """Parse 'role=character' strings into a dict."""
     assignments = {}
     if not assign_list:
         return assignments
     for item in assign_list:
         if "=" not in item:
-            print(f"⚠️ Invalid assignment format: {item} (expected role=character)")
+            print(f"⚠️ Invalid format: {item} (expected role=character)")
             continue
         role_id, char_id = item.split("=", 1)
         if role_id not in BAND_ROLES:
-            print(f"⚠️ Unknown role: {role_id}")
-            print(f"   Available roles: {', '.join(BAND_ROLES.keys())}")
+            print(f"⚠️ Unknown role: {role_id}. Available: {', '.join(BAND_ROLES.keys())}")
             continue
         if char_id not in ANIMAL_CHARACTERS:
-            print(f"⚠️ Unknown character: {char_id}")
-            print(f"   Use --list-characters to see available characters")
+            print(f"⚠️ Unknown character: {char_id}. Use --list-characters to see options.")
             continue
         assignments[role_id] = char_id
     return assignments
@@ -396,14 +490,14 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # 4-piece band with default animals
-  python src/main.py --prompt "A happy pop song" --band-size 4
+  # 4-piece band with female vocalist
+  python src/main.py --prompt "A happy pop song" --band-size 4 --vocal-gender female
 
-  # 5-piece band with custom character assignments
+  # 5-piece band with custom assignments
   python src/main.py --prompt "A rock anthem" --band-size 5 \\
     --assign vocalist=thunder_wolf guitarist=spike_hedgehog
 
-  # List all available characters and roles
+  # Browse characters and roles
   python src/main.py --list-characters
   python src/main.py --list-roles
         """
@@ -411,11 +505,14 @@ Examples:
     parser.add_argument("--prompt", type=str, help="Music prompt")
     parser.add_argument("--band-size", type=int, default=4, choices=range(3, 9),
                         help="Number of band members (3-8, default: 4)")
+    parser.add_argument("--vocal-gender", type=str, default="male",
+                        choices=["male", "female"],
+                        help="Gender of the vocalist (default: male)")
     parser.add_argument("--assign", nargs="*", metavar="ROLE=CHARACTER",
-                        help="Assign animals to roles (e.g. vocalist=luna_cat drummer=rocky_bear)")
+                        help="Assign animals to roles (e.g. vocalist=luna_cat)")
     parser.add_argument("--video-model", type=str, default="MiniMax-Hailuo-2.3",
                         choices=["MiniMax-Hailuo-2.3", "MiniMax-Hailuo-02"],
-                        help="Video model to use")
+                        help="Fallback video model for wide shots")
     parser.add_argument("--list-characters", action="store_true",
                         help="List all available animal characters")
     parser.add_argument("--list-roles", action="store_true",
@@ -423,9 +520,10 @@ Examples:
     args = parser.parse_args()
 
     if args.list_characters:
-        print("\n🐾 Available Animal Characters:\n")
+        print("\n🐾 Available Animal Characters (each has male + female variant):\n")
         print(list_characters())
-        print(f"\n   Total: {len(ANIMAL_CHARACTERS)} characters\n")
+        print(f"\n   Total: {len(ANIMAL_CHARACTERS)} characters × 2 genders = "
+              f"{len(ANIMAL_CHARACTERS) * 2} variants\n")
         exit(0)
 
     if args.list_roles:
@@ -433,7 +531,6 @@ Examples:
         print(list_roles())
         print(f"\n   Total: {len(BAND_ROLES)} roles\n")
         print("   Default roles by band size:")
-        from characters import BAND_PRESETS
         for size, roles in BAND_PRESETS.items():
             print(f"     {size} members: {', '.join(roles)}")
         print()
@@ -444,7 +541,7 @@ Examples:
 
     # Build the band
     assignments = parse_assignments(args.assign)
-    band = build_band(args.band_size, assignments)
+    band = build_band(args.band_size, assignments, args.vocal_gender)
 
     generator = MusicVideoGenerator()
     generator.run(args.prompt, band, args.video_model)
