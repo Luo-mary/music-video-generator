@@ -417,11 +417,27 @@ class MusicVideoGenerator:
 
     # ── Step 5: Lip-sync via Sync.so ─────────────────────────
 
+    def _upload_to_temp_host(self, file_path: str, filename: str) -> str:
+        """Upload a file to a temporary hosting service and return a public URL.
+
+        Uses catbox.moe (free, no signup, files available for extended period).
+        """
+        with open(file_path, "rb") as f:
+            resp = requests.post(
+                "https://catbox.moe/user/api.php",
+                data={"reqtype": "fileupload"},
+                files={"fileToUpload": (filename, f)},
+                timeout=300
+            )
+        if resp.status_code == 200 and resp.text.startswith("https://"):
+            return resp.text.strip()
+        return ""
+
     def lip_sync(self, video_path: str, audio_path: str) -> str:
         """Apply AI lip-sync to the final video using Sync.so API.
 
         Requires SYNC_API_KEY in .env. If not set, skips lip-sync.
-        The API needs publicly accessible URLs, so we upload to a temp host.
+        Files are uploaded to a temp host since Sync.so needs public URLs.
         """
         sync_api_key = os.getenv("SYNC_API_KEY", "")
         if not sync_api_key:
@@ -432,46 +448,20 @@ class MusicVideoGenerator:
         print(f"\n👄 Step 5: Applying lip-sync via Sync.so...")
 
         try:
-            # Sync.so needs URLs — use file upload to get accessible URLs
-            # Upload video
-            print("   📤 Uploading video to Sync.so...")
-            upload_headers = {
-                "x-api-key": sync_api_key,
-            }
-
-            with open(video_path, "rb") as vf:
-                upload_resp = requests.post(
-                    "https://api.sync.so/v2/upload",
-                    headers=upload_headers,
-                    files={"file": ("video.mp4", vf, "video/mp4")},
-                    timeout=300
-                )
-
-            if upload_resp.status_code not in (200, 201):
-                print(f"   ⚠️ Video upload failed: {upload_resp.text[:200]}")
+            # Sync.so needs publicly accessible URLs
+            print("   📤 Uploading video to temp host...")
+            video_url = self._upload_to_temp_host(video_path, "video.mp4")
+            if not video_url:
+                print("   ⚠️ Video upload failed")
                 return video_path
+            print(f"      ✅ Video URL ready")
 
-            video_upload = upload_resp.json()
-            video_url = video_upload.get("url", "")
-            video_asset_id = video_upload.get("id", "")
-
-            # Upload audio
-            print("   📤 Uploading audio to Sync.so...")
-            with open(audio_path, "rb") as af:
-                upload_resp = requests.post(
-                    "https://api.sync.so/v2/upload",
-                    headers=upload_headers,
-                    files={"file": ("audio.mp3", af, "audio/mpeg")},
-                    timeout=300
-                )
-
-            if upload_resp.status_code not in (200, 201):
-                print(f"   ⚠️ Audio upload failed: {upload_resp.text[:200]}")
+            print("   📤 Uploading audio to temp host...")
+            audio_url = self._upload_to_temp_host(audio_path, "audio.mp3")
+            if not audio_url:
+                print("   ⚠️ Audio upload failed")
                 return video_path
-
-            audio_upload = upload_resp.json()
-            audio_url = audio_upload.get("url", "")
-            audio_asset_id = audio_upload.get("id", "")
+            print(f"      ✅ Audio URL ready")
 
             # Create lip-sync generation job
             print("   🎬 Creating lip-sync job...")
@@ -480,31 +470,26 @@ class MusicVideoGenerator:
                 "Content-Type": "application/json",
             }
 
-            # Build input — prefer assetId if available, fall back to url
-            video_input = {"type": "video"}
-            if video_asset_id:
-                video_input["assetId"] = video_asset_id
-            else:
-                video_input["url"] = video_url
-
-            audio_input = {"type": "audio", "refId": "audio_track"}
-            if audio_asset_id:
-                audio_input["assetId"] = audio_asset_id
-            else:
-                audio_input["url"] = audio_url
-
             gen_resp = requests.post(
                 "https://api.sync.so/v2/generate",
                 headers=gen_headers,
                 json={
                     "model": "lipsync-2",
-                    "input": [video_input, audio_input],
+                    "input": [
+                        {"type": "video", "url": video_url},
+                        {"type": "audio", "url": audio_url},
+                    ],
                     "options": {
                         "sync_mode": "cut_off",
                     },
                 },
                 timeout=60
             )
+
+            if gen_resp.status_code == 402:
+                print("   ⚠️ Sync.so free plan limit — audio may be too long (max 20s)")
+                print("   Upgrade at https://sync.so/pricing for longer videos")
+                return video_path
 
             if gen_resp.status_code not in (200, 201):
                 print(f"   ⚠️ Job creation failed: {gen_resp.text[:200]}")
@@ -531,7 +516,6 @@ class MusicVideoGenerator:
                 if status == "COMPLETED":
                     output_url = status_data.get("outputUrl", "")
                     if output_url:
-                        # Download lip-synced video
                         lipsync_path = self.output_dir / "final_video_lipsync.mp4"
                         dl_resp = requests.get(output_url, timeout=300)
                         lipsync_path.write_bytes(dl_resp.content)

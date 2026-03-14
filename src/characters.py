@@ -1014,23 +1014,37 @@ def build_band(size: int, assignments: dict[str, str] = None,
     return band
 
 
-def build_band_prompt(band: list[dict]) -> str:
-    """Build a full video prompt describing the entire band on stage."""
-    member_descriptions = []
-    for m in band:
-        member_descriptions.append(
-            f"{m['character_name']} ({m['species']}): {m['visual']} — "
-            f"playing {m['role']['instrument']} at {m['role']['stage_position']}"
-        )
+def _summarize_member(m: dict) -> str:
+    """Create a short visual summary of a band member (for wide shots with char limit)."""
+    # Extract key visual traits: species, fur/skin color, main outfit piece
+    species = m["species"]
+    name = m["character_name"]
+    role = m["role"]
+    gender = m["gender"]
+    pronoun = "she" if gender == "female" else "he"
 
+    # Build a compact description (~80-100 chars per member)
+    return (
+        f"{name}, a cute {gender} {species}, "
+        f"playing {role['instrument']} at {role['stage_position']}"
+    )
+
+
+def build_band_prompt(band: list[dict]) -> str:
+    """Build a video prompt describing the entire band on stage.
+
+    Uses condensed character descriptions to stay under the 3000 char API limit.
+    """
+    member_descriptions = [_summarize_member(m) for m in band]
     members_text = "; ".join(member_descriptions)
 
     return (
         f"A cute 3D Pixar-style cartoon animated music video of an anthropomorphic animal band "
         f"performing on a vibrant colorful festival stage with neon lights and confetti. "
         f"The band members are: {members_text}. "
-        f"All characters are cute, friendly, cool, and fashionable. They are fully anthropomorphic, "
-        f"standing upright, with joyful expressive faces and dynamic fun body movements. "
+        f"All characters are cute, friendly, cool, and fashionable, wearing trendy musician outfits. "
+        f"They are fully anthropomorphic, standing upright, with joyful expressive faces "
+        f"and dynamic fun body movements. "
         f"High quality 3D cartoon animation, vibrant colors, dramatic fun stage lighting."
     )
 
