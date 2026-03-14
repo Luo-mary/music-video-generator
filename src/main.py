@@ -46,12 +46,12 @@ def build_scene_sequence(band: list[dict], num_clips: int) -> list[dict]:
     - Close-ups: subject_member = the specific band member
     """
     wide_scenes = [
-        "Wide establishing shot, camera slowly zooming in, dramatic colorful stage lighting.",
-        "Wide shot from audience view, cartoon crowd cheering, confetti falling, fun atmosphere.",
-        "Low angle wide shot looking up at the band, powerful fun stage presence, lens flare.",
-        "Side-angle wide shot, colorful spotlights sweeping, fun smoke effects on stage.",
-        "Overhead bird's-eye view of the stage, radial neon light patterns, festive mood.",
-        "Wide dynamic shot, all band members jumping together, explosive joyful energy.",
+        "Wide establishing shot, camera slowly zooming in, dramatic cinematic stage lighting, moody atmosphere.",
+        "Wide shot from audience perspective, silhouettes in the crowd, atmospheric haze, concert vibe.",
+        "Low angle wide shot looking up at the band, powerful stage presence, lens flare, cinematic.",
+        "Side-angle wide shot, spotlights cutting through smoke, dramatic shadows on stage.",
+        "Overhead bird's-eye view of the stage, geometric light patterns, atmospheric mood.",
+        "Wide dynamic shot, all band members performing intensely, dramatic energy, cinematic angles.",
     ]
 
     band_prompt = build_band_prompt(band)
@@ -577,13 +577,10 @@ class MusicVideoGenerator:
             return ""
 
         # Step 4: Merge clips + music
-        merged_path = self.merge_final_video(clip_paths, music_path)
-        if not merged_path:
+        final_path = self.merge_final_video(clip_paths, music_path)
+        if not final_path:
             print("\n❌ Failed to merge video.")
             return ""
-
-        # Step 5: Lip-sync (optional, requires SYNC_API_KEY)
-        final_path = self.lip_sync(merged_path, music_path)
 
         print("\n" + "=" * 60)
         print(f"  ✅ Done! Final music video: {final_path}")
