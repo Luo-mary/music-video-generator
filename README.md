@@ -97,6 +97,34 @@ All generated files are saved to the `output/` directory:
 | `clips/clip_XXX_enc.mp4` | Individual re-encoded video clips |
 | `final_video.mp4` | Final music video (all clips + music merged) |
 
+## Controlling Duration
+
+### Music Length
+
+The Music API has no direct `duration` parameter. Song length is determined by lyrics content:
+
+| Want | How |
+|------|-----|
+| Shorter song (~1 min) | Write short lyrics — one verse + one chorus |
+| Longer song (~3 min) | Write full lyrics with multiple sections |
+
+Use the `--prompt` to describe the song, and structure your lyrics with tags like `[Verse]`, `[Chorus]`, `[Bridge]`, `[Outro]` to control the song structure. Enable `lyrics_optimizer` (on by default) to auto-generate lyrics from your prompt.
+
+### Video Length
+
+Each video clip has a fixed max duration depending on the model:
+
+| Model | Clip Duration |
+|-------|---------------|
+| `MiniMax-Hailuo-2.3` | ~6 seconds |
+| `MiniMax-Hailuo-02` | up to 10 seconds |
+
+The tool automatically generates enough clips to cover the full music duration. Using `MiniMax-Hailuo-02` means fewer clips needed (and fewer API calls).
+
+### Final Video
+
+The final video length is determined by whichever is shorter — the concatenated video or the music track. They are merged with `ffmpeg -shortest`.
+
 ## How It Works
 
 1. **Music generation** — Sends the prompt to MiniMax Music API (`music-2.5+`), receives hex-encoded MP3 audio
