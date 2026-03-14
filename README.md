@@ -13,6 +13,12 @@ Generate full-length music videos with cartoon animal bands from text prompts. P
 
 The tool automatically calculates how many video clips are needed to match the music duration, generates them with varied camera angles/scenes, handles API rate limits, and stitches everything together into one music video with audio.
 
+## Demo
+
+Prompt: *"A joyful upbeat song for a happy animal festival, with playful drums, bouncy bass, cheerful guitar, and fun lyrics about cartoon animals dancing and celebrating together"*
+
+[Download demo video (final_video.mp4)](https://github.com/Luo-mary/music-video-generator/releases/download/v1.0/final_video.mp4)
+
 ## Quick Start
 
 ### 1. Install dependencies
